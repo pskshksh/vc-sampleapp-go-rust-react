@@ -1,0 +1,17 @@
+# Rust
+services/rscounter/target/
+
+# Go
+services/goapi/goapi
+
+# Node
+node_modules/
+js/dist/
+
+# Env
+.env
+
+# OS
+.DS_Store
+
+.idea/

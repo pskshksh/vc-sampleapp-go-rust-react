@@ -1,0 +1,89 @@
+.app {
+  max-width: 32rem;
+  margin: 4rem auto;
+  padding: 0 1.5rem;
+  text-align: center;
+  font-family: system-ui, -apple-system, sans-serif;
+}
+
+.app h1 {
+  font-size: 1rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #888;
+  margin-bottom: 0.5rem;
+}
+
+.date {
+  font-size: 1.75rem;
+  font-weight: 700;
+  margin: 0 0 2.5rem;
+}
+
+.counters {
+  display: flex;
+  gap: 1.5rem;
+  justify-content: center;
+}
+
+.counter {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  padding: 1.5rem;
+  border: 1px solid #3333;
+  border-radius: 0.75rem;
+  min-width: 8rem;
+}
+
+.counter .value {
+  font-size: 2.5rem;
+  font-weight: 800;
+  line-height: 1;
+}
+
+.counter .label {
+  font-size: 0.8rem;
+  color: #888;
+}
+
+.history {
+  margin-top: 3rem;
+  text-align: left;
+}
+
+.history h2 {
+  font-size: 0.8rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #888;
+  margin-bottom: 0.75rem;
+}
+
+.history ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.history li {
+  display: flex;
+  justify-content: space-between;
+  padding: 0.6rem 0;
+  border-bottom: 1px solid #3333;
+}
+
+.history .count {
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.muted {
+  color: #888;
+}
+
+.error {
+  color: #c0392b;
+}
