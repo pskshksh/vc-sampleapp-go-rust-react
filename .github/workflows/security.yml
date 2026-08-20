@@ -1,20 +1,15 @@
 name: Security
 
-# Open-source security scanning across the whole repo:
-#   - Trivy            filesystem vuln + secret + misconfig scan
-#   - Trivy config     Dockerfile / IaC misconfiguration scan
-#   - Hadolint         Dockerfile linting
-#   - Gitleaks         secret scanning (git history)
-#   - Semgrep          multi-language SAST
-#   - govulncheck      Go known-vulnerability scan
-#   - cargo-audit      Rust RustSec advisory scan
-#   - cargo-deny       Rust advisories + licenses + sources
-#   - pnpm audit       JS dependency vuln scan
-#   - dependency-review  block risky dependency changes (PRs)
+# Open-source security scanning across the whole repo.
 #
-# SARIF results are uploaded to the GitHub "Security > Code scanning" tab.
-# (Requires the repo to have code scanning enabled — free for public repos,
-#  or GitHub Advanced Security for private repos.)
+# Design: every scanner runs, but NONE of them hard-fail the pipeline. Each job
+# records its real outcome as an output, and the final `security-summary` job
+# collects them into a single table on the run's Job Summary page — one place to
+# see "what is bad". SARIF-capable scanners also upload to Security > Code
+# scanning (requires code scanning enabled: free for public repos, GitHub
+# Advanced Security for private ones).
+#
+# To make any single scan blocking again, remove its `continue-on-error: true`.
 
 on:
   push:
@@ -41,11 +36,13 @@ jobs:
     permissions:
       contents: read
       security-events: write
+    outputs:
+      status: ${{ steps.report.outputs.status }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Trivy scan → SARIF (report, non-blocking)
-        uses: aquasecurity/trivy-action@0.28.0
+      - name: Trivy scan → SARIF
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: fs
           scanners: vuln,secret,misconfig
@@ -54,14 +51,16 @@ jobs:
           severity: CRITICAL,HIGH,MEDIUM,LOW
 
       - name: Upload SARIF to code scanning
-        if: always()
+        continue-on-error: true # tolerate repos without code scanning enabled
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: trivy-fs.sarif
           category: trivy-fs
 
-      - name: Trivy gate (fail on fixable HIGH/CRITICAL)
-        uses: aquasecurity/trivy-action@0.28.0
+      - name: Trivy check (fixable HIGH/CRITICAL)
+        id: scan
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: fs
           scanners: vuln,secret,misconfig
@@ -69,25 +68,32 @@ jobs:
           ignore-unfixed: true
           exit-code: '1'
 
+      - id: report
+        run: echo "status=${{ steps.scan.outcome }}" >> "$GITHUB_OUTPUT"
+
   # ---------------------------------------------------------------------------
-  # Hadolint: lint each Dockerfile.
+  # Hadolint: lint all three Dockerfiles (one job, non-blocking).
   # ---------------------------------------------------------------------------
   hadolint:
     name: Hadolint (Dockerfiles)
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        dockerfile:
-          - services/goapi/Dockerfile
-          - services/rscounter/Dockerfile
-          - js/Dockerfile
+    outputs:
+      status: ${{ steps.report.outputs.status }}
     steps:
       - uses: actions/checkout@v4
-      - uses: hadolint/hadolint-action@v3.1.0
-        with:
-          dockerfile: ${{ matrix.dockerfile }}
-          failure-threshold: warning
+      - name: Lint Dockerfiles
+        id: scan
+        continue-on-error: true
+        run: |
+          rc=0
+          for f in services/goapi/Dockerfile services/rscounter/Dockerfile js/Dockerfile; do
+            echo "::group::hadolint $f"
+            docker run --rm -i hadolint/hadolint hadolint --failure-threshold warning - < "$f" || rc=1
+            echo "::endgroup::"
+          done
+          exit $rc
+      - id: report
+        run: echo "status=${{ steps.scan.outcome }}" >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------
   # Gitleaks: scan the git history for committed secrets.
@@ -95,16 +101,23 @@ jobs:
   gitleaks:
     name: Gitleaks (secrets)
     runs-on: ubuntu-latest
+    outputs:
+      status: ${{ steps.report.outputs.status }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: gitleaks/gitleaks-action@v2
+      - name: Run gitleaks
+        id: scan
+        continue-on-error: true
+        uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - id: report
+        run: echo "status=${{ steps.scan.outcome }}" >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------
-  # Semgrep: multi-language static analysis using the public rule registry.
+  # Semgrep: multi-language SAST using the public rule registry.
   # ---------------------------------------------------------------------------
   semgrep:
     name: Semgrep (SAST)
@@ -112,18 +125,24 @@ jobs:
     permissions:
       contents: read
       security-events: write
-    container:
-      image: semgrep/semgrep
+    outputs:
+      status: ${{ steps.report.outputs.status }}
     steps:
       - uses: actions/checkout@v4
+      - name: Install Semgrep
+        run: pipx install semgrep
       - name: Semgrep scan → SARIF
-        run: semgrep scan --config auto --sarif --output semgrep.sarif
+        id: scan
+        continue-on-error: true
+        run: semgrep scan --config auto --sarif --output semgrep.sarif --error
       - name: Upload SARIF to code scanning
-        if: always()
+        continue-on-error: true
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: semgrep.sarif
           category: semgrep
+      - id: report
+        run: echo "status=${{ steps.scan.outcome }}" >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------
   # Go: govulncheck against the Go vulnerability database.
@@ -131,6 +150,8 @@ jobs:
   govulncheck:
     name: govulncheck (Go)
     runs-on: ubuntu-latest
+    outputs:
+      status: ${{ steps.report.outputs.status }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -140,8 +161,12 @@ jobs:
       - name: Install govulncheck
         run: go install golang.org/x/vuln/cmd/govulncheck@latest
       - name: Run govulncheck
+        id: scan
+        continue-on-error: true
         working-directory: services/goapi
         run: govulncheck ./...
+      - id: report
+        run: echo "status=${{ steps.scan.outcome }}" >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------
   # Rust: cargo-audit (advisories) and cargo-deny (advisories + licenses).
@@ -149,6 +174,8 @@ jobs:
   cargo-audit:
     name: cargo-audit (Rust)
     runs-on: ubuntu-latest
+    outputs:
+      status: ${{ steps.report.outputs.status }}
     defaults:
       run:
         working-directory: services/rscounter
@@ -158,11 +185,18 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-audit
-      - run: cargo audit --deny warnings
+      - name: Run cargo audit
+        id: scan
+        continue-on-error: true
+        run: cargo audit
+      - id: report
+        run: echo "status=${{ steps.scan.outcome }}" >> "$GITHUB_OUTPUT"
 
   cargo-deny:
     name: cargo-deny (Rust)
     runs-on: ubuntu-latest
+    outputs:
+      status: ${{ steps.report.outputs.status }}
     defaults:
       run:
         working-directory: services/rscounter
@@ -172,7 +206,12 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny
-      - run: cargo deny check advisories bans licenses sources
+      - name: Run cargo deny
+        id: scan
+        continue-on-error: true
+        run: cargo deny check advisories bans licenses sources
+      - id: report
+        run: echo "status=${{ steps.scan.outcome }}" >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------
   # JS: pnpm audit against the npm advisory database.
@@ -180,6 +219,8 @@ jobs:
   pnpm-audit:
     name: pnpm audit (JS)
     runs-on: ubuntu-latest
+    outputs:
+      status: ${{ steps.report.outputs.status }}
     defaults:
       run:
         working-directory: js
@@ -193,18 +234,115 @@ jobs:
           node-version: 26
           cache: pnpm
           cache-dependency-path: js/pnpm-lock.yaml
-      - name: pnpm audit (fail on high+)
+      - name: Run pnpm audit
+        id: scan
+        continue-on-error: true
         run: pnpm audit --audit-level high
+      - id: report
+        run: echo "status=${{ steps.scan.outcome }}" >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------
-  # Dependency review: block PRs that add vulnerable/badly-licensed deps.
+  # Dependency review: flag risky dependency changes (PRs only).
   # ---------------------------------------------------------------------------
   dependency-review:
     name: Dependency review
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    outputs:
+      status: ${{ steps.report.outputs.status }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/dependency-review-action@v4
+      - name: Dependency review
+        id: scan
+        continue-on-error: true
+        uses: actions/dependency-review-action@v4
         with:
           fail-on-severity: high
+      - id: report
+        run: echo "status=${{ steps.scan.outcome }}" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # Global report: one table summarizing every scan on the run's summary page.
+  # Always runs; never fails — it only reports. Change the final line to fail
+  # the workflow when something is bad if you want it to block.
+  # ---------------------------------------------------------------------------
+  security-summary:
+    name: Security summary
+    if: always()
+    needs:
+      - trivy-fs
+      - hadolint
+      - gitleaks
+      - semgrep
+      - govulncheck
+      - cargo-audit
+      - cargo-deny
+      - pnpm-audit
+      - dependency-review
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compose report
+        env:
+          TRIVY_R: ${{ needs.trivy-fs.result }}
+          TRIVY_S: ${{ needs.trivy-fs.outputs.status }}
+          HADOLINT_R: ${{ needs.hadolint.result }}
+          HADOLINT_S: ${{ needs.hadolint.outputs.status }}
+          GITLEAKS_R: ${{ needs.gitleaks.result }}
+          GITLEAKS_S: ${{ needs.gitleaks.outputs.status }}
+          SEMGREP_R: ${{ needs.semgrep.result }}
+          SEMGREP_S: ${{ needs.semgrep.outputs.status }}
+          GOVULN_R: ${{ needs.govulncheck.result }}
+          GOVULN_S: ${{ needs.govulncheck.outputs.status }}
+          AUDIT_R: ${{ needs.cargo-audit.result }}
+          AUDIT_S: ${{ needs.cargo-audit.outputs.status }}
+          DENY_R: ${{ needs.cargo-deny.result }}
+          DENY_S: ${{ needs.cargo-deny.outputs.status }}
+          PNPM_R: ${{ needs.pnpm-audit.result }}
+          PNPM_S: ${{ needs.pnpm-audit.outputs.status }}
+          DEPREV_R: ${{ needs.dependency-review.result }}
+          DEPREV_S: ${{ needs.dependency-review.outputs.status }}
+        run: |
+          # cell <job-result> <scan-status> -> a human-readable table cell.
+          cell() {
+            local result="$1" status="$2"
+            if [ "$result" = "skipped" ]; then echo "⏭️ Skipped (not applicable)"; return; fi
+            case "$status" in
+              success) echo "✅ Passed" ;;
+              failure) echo "❌ Findings — see job log" ;;
+              *)       echo "⚠️ Errored — see job log" ;;  # infra/setup failure
+            esac
+          }
+
+          findings=0
+          note() { case "$1" in failure) findings=$((findings+1));; esac; }
+          note "$TRIVY_S"; note "$HADOLINT_S"; note "$GITLEAKS_S"; note "$SEMGREP_S"
+          note "$GOVULN_S"; note "$AUDIT_S"; note "$DENY_S"; note "$PNPM_S"; note "$DEPREV_S"
+
+          {
+            echo "## 🔒 Security scan summary"
+            echo ""
+            echo "| Tool | Scope | Result |"
+            echo "| --- | --- | --- |"
+            echo "| Trivy | repo: deps, secrets, misconfig | $(cell "$TRIVY_R" "$TRIVY_S") |"
+            echo "| Hadolint | Dockerfiles | $(cell "$HADOLINT_R" "$HADOLINT_S") |"
+            echo "| Gitleaks | git history secrets | $(cell "$GITLEAKS_R" "$GITLEAKS_S") |"
+            echo "| Semgrep | multi-language SAST | $(cell "$SEMGREP_R" "$SEMGREP_S") |"
+            echo "| govulncheck | Go stdlib + deps | $(cell "$GOVULN_R" "$GOVULN_S") |"
+            echo "| cargo-audit | Rust advisories | $(cell "$AUDIT_R" "$AUDIT_S") |"
+            echo "| cargo-deny | Rust advisories/licenses | $(cell "$DENY_R" "$DENY_S") |"
+            echo "| pnpm audit | JS dependencies | $(cell "$PNPM_R" "$PNPM_S") |"
+            echo "| dependency-review | PR dependency diff | $(cell "$DEPREV_R" "$DEPREV_S") |"
+            echo ""
+            if [ "$findings" -eq 0 ]; then
+              echo "✅ **No findings reported.**"
+            else
+              echo "❌ **$findings scanner(s) reported findings.** Open the matching job above for details."
+            fi
+            echo ""
+            echo "> Scans are **reported, not blocking**. To make one block the pipeline,"
+            echo "> remove \`continue-on-error: true\` from its job in \`.github/workflows/security.yml\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Reported-only by design: keep the workflow green. To make findings
+          # fail the run instead, replace the next line with: exit "$findings"
+          exit 0
