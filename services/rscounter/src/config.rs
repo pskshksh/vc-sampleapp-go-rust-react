@@ -32,3 +32,38 @@ impl Config {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // These tests mutate process-wide environment variables, so keep them in a
+    // single test to avoid races between parallel test threads.
+    #[test]
+    fn from_env_reads_overrides_and_defaults() {
+        // SAFETY: single-threaded within this test; no other test touches these
+        // variables concurrently.
+        unsafe {
+            env::set_var(ENV_DATABASE_URL, "postgres://u:p@db:5432/app");
+            env::remove_var(ENV_ADDR);
+        }
+
+        let cfg = Config::from_env();
+        assert_eq!(cfg.database_url, "postgres://u:p@db:5432/app");
+        // ENV_ADDR is unset, so the documented default applies.
+        assert_eq!(cfg.addr, DEFAULT_ADDR);
+
+        unsafe {
+            env::remove_var(ENV_DATABASE_URL);
+        }
+        let cfg = Config::from_env();
+        assert_eq!(cfg.database_url, DEFAULT_DATABASE_URL);
+    }
+
+    #[test]
+    fn defaults_are_well_formed() {
+        assert!(DEFAULT_DATABASE_URL.starts_with("postgres://"));
+        assert!(DEFAULT_ADDR.contains(':'));
+        assert!(MAX_CONNECTIONS > 0);
+    }
+}

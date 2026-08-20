@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { formatDate } from './format'
 import './App.css'
 
 // Shape returned by goapi's GET /api/today.
@@ -12,15 +13,6 @@ type Today = {
 type DayCount = {
   date: string
   count: number
-}
-
-function formatDate(date: string) {
-  return new Date(`${date}T00:00:00`).toLocaleDateString(undefined, {
-    weekday: 'long',
-    year: 'numeric',
-    month: 'long',
-    day: 'numeric',
-  })
 }
 
 function App() {

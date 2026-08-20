@@ -1,0 +1,210 @@
+name: Security
+
+# Open-source security scanning across the whole repo:
+#   - Trivy            filesystem vuln + secret + misconfig scan
+#   - Trivy config     Dockerfile / IaC misconfiguration scan
+#   - Hadolint         Dockerfile linting
+#   - Gitleaks         secret scanning (git history)
+#   - Semgrep          multi-language SAST
+#   - govulncheck      Go known-vulnerability scan
+#   - cargo-audit      Rust RustSec advisory scan
+#   - cargo-deny       Rust advisories + licenses + sources
+#   - pnpm audit       JS dependency vuln scan
+#   - dependency-review  block risky dependency changes (PRs)
+#
+# SARIF results are uploaded to the GitHub "Security > Code scanning" tab.
+# (Requires the repo to have code scanning enabled — free for public repos,
+#  or GitHub Advanced Security for private repos.)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * 1' # weekly Monday 06:00 UTC — catch newly disclosed CVEs
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Trivy: dependencies, leaked secrets, and misconfigurations across the repo.
+  # ---------------------------------------------------------------------------
+  trivy-fs:
+    name: Trivy (vuln + secret + misconfig)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Trivy scan → SARIF (report, non-blocking)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scanners: vuln,secret,misconfig
+          format: sarif
+          output: trivy-fs.sarif
+          severity: CRITICAL,HIGH,MEDIUM,LOW
+
+      - name: Upload SARIF to code scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-fs
+
+      - name: Trivy gate (fail on fixable HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scanners: vuln,secret,misconfig
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: '1'
+
+  # ---------------------------------------------------------------------------
+  # Hadolint: lint each Dockerfile.
+  # ---------------------------------------------------------------------------
+  hadolint:
+    name: Hadolint (Dockerfiles)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dockerfile:
+          - services/goapi/Dockerfile
+          - services/rscounter/Dockerfile
+          - js/Dockerfile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: ${{ matrix.dockerfile }}
+          failure-threshold: warning
+
+  # ---------------------------------------------------------------------------
+  # Gitleaks: scan the git history for committed secrets.
+  # ---------------------------------------------------------------------------
+  gitleaks:
+    name: Gitleaks (secrets)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ---------------------------------------------------------------------------
+  # Semgrep: multi-language static analysis using the public rule registry.
+  # ---------------------------------------------------------------------------
+  semgrep:
+    name: Semgrep (SAST)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    container:
+      image: semgrep/semgrep
+    steps:
+      - uses: actions/checkout@v4
+      - name: Semgrep scan → SARIF
+        run: semgrep scan --config auto --sarif --output semgrep.sarif
+      - name: Upload SARIF to code scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+  # ---------------------------------------------------------------------------
+  # Go: govulncheck against the Go vulnerability database.
+  # ---------------------------------------------------------------------------
+  govulncheck:
+    name: govulncheck (Go)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: services/goapi/go.mod
+          cache: false
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+      - name: Run govulncheck
+        working-directory: services/goapi
+        run: govulncheck ./...
+
+  # ---------------------------------------------------------------------------
+  # Rust: cargo-audit (advisories) and cargo-deny (advisories + licenses).
+  # ---------------------------------------------------------------------------
+  cargo-audit:
+    name: cargo-audit (Rust)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/rscounter
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - run: cargo audit --deny warnings
+
+  cargo-deny:
+    name: cargo-deny (Rust)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/rscounter
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - run: cargo deny check advisories bans licenses sources
+
+  # ---------------------------------------------------------------------------
+  # JS: pnpm audit against the npm advisory database.
+  # ---------------------------------------------------------------------------
+  pnpm-audit:
+    name: pnpm audit (JS)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: js
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26
+          cache: pnpm
+          cache-dependency-path: js/pnpm-lock.yaml
+      - name: pnpm audit (fail on high+)
+        run: pnpm audit --audit-level high
+
+  # ---------------------------------------------------------------------------
+  # Dependency review: block PRs that add vulnerable/badly-licensed deps.
+  # ---------------------------------------------------------------------------
+  dependency-review:
+    name: Dependency review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high

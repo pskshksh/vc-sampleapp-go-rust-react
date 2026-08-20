@@ -1,0 +1,37 @@
+# cargo-deny configuration — see https://embarkstudios.github.io/cargo-deny/
+# Used by the "cargo-deny" job in .github/workflows/security.yml.
+
+[advisories]
+version = 2
+# Fail on any crate pulled from a yanked release.
+yanked = "deny"
+
+[bans]
+# Warn (don't fail) when multiple versions of the same crate are pulled in.
+multiple-versions = "warn"
+wildcards = "warn"
+
+[licenses]
+version = 2
+# Allow the common permissive/OSS licenses used across the dependency tree.
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "CC0-1.0",
+  "MPL-2.0",
+  "OpenSSL",
+]
+confidence-threshold = 0.9
+
+[sources]
+# Only allow crates from the official registry; reject unknown registries/git.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

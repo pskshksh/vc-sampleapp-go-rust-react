@@ -1,0 +1,186 @@
+name: CI
+
+# Build, lint, and test every service on each push and pull request.
+# Security scanning lives in security.yml and codeql.yml.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref to save minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege by default; jobs opt into more if they need it.
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Only run a language's job when its files (or this workflow) changed.
+  # ---------------------------------------------------------------------------
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      go: ${{ steps.filter.outputs.go }}
+      rust: ${{ steps.filter.outputs.rust }}
+      js: ${{ steps.filter.outputs.js }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            go:
+              - 'services/goapi/**'
+              - '.github/workflows/ci.yml'
+            rust:
+              - 'services/rscounter/**'
+              - '.github/workflows/ci.yml'
+            js:
+              - 'js/**'
+              - '.github/workflows/ci.yml'
+
+  # ---------------------------------------------------------------------------
+  # Go (services/goapi): format, vet, static analysis, lint, test, build.
+  # ---------------------------------------------------------------------------
+  go:
+    needs: changes
+    if: ${{ needs.changes.outputs.go == 'true' }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/goapi
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: services/goapi/go.mod
+          cache: false # stdlib-only module, no go.sum to key a cache on
+
+      - name: gofmt (formatting)
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "::error::These files are not gofmt-clean:"; echo "$out"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: staticcheck
+        uses: dominikh/staticcheck-action@v1
+        with:
+          install-go: false
+          working-directory: services/goapi
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          working-directory: services/goapi
+
+      - name: Test (race + coverage)
+        run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
+
+      - name: Build
+        run: go build ./...
+
+  # ---------------------------------------------------------------------------
+  # Rust (services/rscounter): format, clippy, test, release build.
+  # ---------------------------------------------------------------------------
+  rust:
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/rscounter
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: services/rscounter
+
+      - name: rustfmt (formatting)
+        run: cargo fmt --all -- --check
+
+      - name: clippy (lint, warnings = errors)
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --all-features --locked
+
+      - name: Build (release)
+        run: cargo build --release --locked
+
+  # ---------------------------------------------------------------------------
+  # JS/React (js): lint, typecheck, test (if present), production build.
+  # ---------------------------------------------------------------------------
+  js:
+    needs: changes
+    if: ${{ needs.changes.outputs.js == 'true' }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: js
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26
+          cache: pnpm
+          cache-dependency-path: js/pnpm-lock.yaml
+
+      - name: Install (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint (oxlint)
+        run: pnpm lint
+
+      - name: Typecheck (tsc)
+        run: pnpm typecheck
+
+      - name: Test (if a test script exists)
+        run: |
+          if node -e "process.exit((require('./package.json').scripts||{}).test?0:1)"; then
+            pnpm test
+          else
+            echo "No test script defined in package.json — skipping."
+          fi
+
+      - name: Build
+        run: pnpm build
+
+  # ---------------------------------------------------------------------------
+  # Single required status for branch protection: green only if nothing failed.
+  # Skipped language jobs (unchanged paths) are allowed.
+  # ---------------------------------------------------------------------------
+  ci-success:
+    if: always()
+    needs: [go, rust, js]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check job results
+        run: |
+          for r in ${{ needs.go.result }} ${{ needs.rust.result }} ${{ needs.js.result }}; do
+            if [ "$r" != "success" ] && [ "$r" != "skipped" ]; then
+              echo "::error::A CI job did not succeed (result: $r)"
+              exit 1
+            fi
+          done
+          echo "All CI jobs passed or were skipped."
