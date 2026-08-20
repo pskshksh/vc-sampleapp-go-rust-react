@@ -22,15 +22,37 @@ pub struct AppState {
 /// Builds the router with all routes registered.
 pub fn routes(state: AppState) -> Router {
     Router::new()
-        .route("/health", get(health))
+        .route("/livez", get(livez))
+        .route("/readyz", get(readyz))
         .route("/events", post(record_event))
         .route("/counter", get(get_counter))
         .route("/history", get(get_history))
         .with_state(state)
 }
 
-async fn health() -> impl IntoResponse {
+/// Liveness probe: the process is running. Deliberately checks no dependencies,
+/// so a transient database outage never triggers a pod restart.
+async fn livez() -> impl IntoResponse {
     (StatusCode::OK, Json(serde_json::json!({ "status": "ok" })))
+}
+
+/// Readiness probe: the service can reach Postgres, so it is ready to serve
+/// traffic. Fails with 503 (not 500) so Kubernetes pulls the pod out of the
+/// Service endpoints without restarting it.
+async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
+    match db::ping(&state.pool).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "status": "ready" })),
+        ),
+        Err(err) => {
+            tracing::warn!("readiness check failed: {err:#}");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "status": "unready", "error": err.to_string() })),
+            )
+        }
+    }
 }
 
 /// Records a new event for the given day and returns the fresh counts.

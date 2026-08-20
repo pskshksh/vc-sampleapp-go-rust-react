@@ -43,14 +43,54 @@ func newServer(cfg Config, log *slog.Logger) *server {
 // routes registers all HTTP routes and returns the top-level handler.
 func (s *server) routes() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /health", s.handleHealth)
+	mux.HandleFunc("GET /livez", s.handleLivez)
+	mux.HandleFunc("GET /readyz", s.handleReadyz)
 	mux.HandleFunc("GET /api/today", s.handleToday)
 	mux.HandleFunc("GET /api/history", s.handleHistory)
 	return s.withCORS(mux)
 }
 
-func (s *server) handleHealth(w http.ResponseWriter, _ *http.Request) {
+// handleLivez is the liveness probe: the process is up. It checks no
+// dependencies, so rscounter being down never restarts goapi.
+func (s *server) handleLivez(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// handleReadyz is the readiness probe: goapi can reach rscounter, so it can
+// serve the /api endpoints that proxy to it. Fails with 503 so Kubernetes
+// pulls the pod from the Service endpoints without restarting it.
+func (s *server) handleReadyz(w http.ResponseWriter, r *http.Request) {
+	if err := s.pingRscounter(r.Context()); err != nil {
+		s.log.Warn("readiness check failed", "err", err)
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+			"status": "unready",
+			"error":  err.Error(),
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
+}
+
+// pingRscounter checks rscounter is reachable via its liveness endpoint. It
+// intentionally targets /livez, not /readyz, so goapi's readiness does not
+// cascade off rscounter's database state.
+func (s *server) pingRscounter(ctx context.Context) error {
+	url := s.cfg.RscounterURL + "/livez"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("rscounter returned %d", resp.StatusCode)
+	}
+	return nil
 }
 
 // handleToday records a hit for today in rscounter and returns the date plus counts.

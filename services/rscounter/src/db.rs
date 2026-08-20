@@ -28,6 +28,13 @@ const COUNT_ALL: &str = "SELECT COUNT(*) AS n FROM events";
 const HISTORY: &str =
     "SELECT event_date, COUNT(*) AS n FROM events GROUP BY event_date ORDER BY event_date DESC";
 
+/// Lightweight connectivity check for the readiness probe: confirms the pool
+/// can round-trip a query to Postgres.
+pub async fn ping(pool: &PgPool) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT 1").execute(pool).await?;
+    Ok(())
+}
+
 /// Ensures the schema exists so the service is runnable on a fresh database.
 ///
 /// Each statement runs separately: Postgres rejects multiple commands in one
