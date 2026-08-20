@@ -138,28 +138,40 @@ All scans use open-source tooling and run in parallel. Results that support
 The Security workflow also runs **weekly on a schedule** so newly disclosed CVEs
 are caught even without a code change.
 
-#### Reported, not blocking — with one global report
+#### Reported, not blocking — with one actionable report
 
 Security findings often can't be fixed on the spot (an unpatched transitive
 crate, a standard-library CVE fixed only in a newer toolchain). So every scanner
 runs with `continue-on-error: true`: it **reports but does not fail the
-pipeline**. Each job records its real outcome, and a final **`security-summary`**
-job collects them into a single table on the run's **Job Summary** page — the one
-place to see what's bad:
+pipeline**. Each scanner writes a machine-readable report (JSON/SARIF) as a
+build artifact, and a final **`security-summary`** job downloads them all and
+parses them into **one ranked, actionable report** on the run's **Job Summary**
+page — severity counts, the exact advisory/rule ID, the affected package, the
+version to upgrade to, and `file:line` for code/secret issues:
 
 ```
-## 🔒 Security scan summary
-| Tool        | Scope                          | Result                    |
-| ----------- | ------------------------------ | ------------------------- |
-| Trivy       | repo: deps, secrets, misconfig | ✅ Passed                 |
-| govulncheck | Go stdlib + deps               | ❌ Findings — see job log |
-| cargo-audit | Rust advisories                | ❌ Findings — see job log |
-| ...         | ...                            | ...                       |
+## 🔒 Security findings
+Total: 6  ·  🔴 Critical: 1   🟠 High: 3   🟡 Medium: 2   ⚪ Low: 0
+
+### 📦 Dependencies to upgrade
+| Severity | Package (installed) | Fix → version | Advisory          | Scanner     |
+| -------- | ------------------- | ------------- | ----------------- | ----------- |
+| HIGH     | react-dom@19.2.8    | 19.2.9        | CVE-2025-1234     | trivy       |
+| HIGH     | rsa@0.9.10          | ⚠️ no fix yet | RUSTSEC-2023-0071 | cargo-audit |
+| MEDIUM   | axios               | >=1.7.4       | GHSA-x            | pnpm-audit  |
+
+### 🔎 Code, secrets & Dockerfile findings
+| Severity | Type       | Scanner  | Rule/ID          | Location                      | Detail            |
+| -------- | ---------- | -------- | ---------------- | ----------------------------- | ----------------- |
+| CRITICAL | secret     | trivy    | generic-api-key  | services/goapi/.env.example:3 | API key           |
+| HIGH     | code       | semgrep  | net.use-tls      | services/goapi/handlers.go:84 | Use TLS for calls |
+| MEDIUM   | dockerfile | hadolint | DL3008           | services/rscounter/Dockerfile:12 | Pin apt versions |
 ```
 
-To make a scan **block** the pipeline instead, remove `continue-on-error: true`
-from its job (or change the summary's final `exit 0` to `exit "$findings"` to
-fail whenever any scanner reports something).
+The normalized findings are also uploaded as a `security-findings` artifact
+(one JSON object per line) for downstream tooling. To make findings **block** the
+pipeline, remove `continue-on-error: true` from a scanner's job, or change the
+summary's final `exit 0` to fail when `total` > 0.
 
 ### CodeQL workflow
 

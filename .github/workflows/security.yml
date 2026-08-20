@@ -2,14 +2,15 @@ name: Security
 
 # Open-source security scanning across the whole repo.
 #
-# Design: every scanner runs, but NONE of them hard-fail the pipeline. Each job
-# records its real outcome as an output, and the final `security-summary` job
-# collects them into a single table on the run's Job Summary page — one place to
-# see "what is bad". SARIF-capable scanners also upload to Security > Code
-# scanning (requires code scanning enabled: free for public repos, GitHub
-# Advanced Security for private ones).
+# Design: every scanner runs and writes a MACHINE-READABLE report (JSON/SARIF),
+# uploaded as an artifact. None of them hard-fail the pipeline. The final
+# `security-summary` job downloads every report and parses it into ONE ranked,
+# actionable table on the run's Job Summary page: severity, advisory/rule ID,
+# affected package, the version to upgrade to, and file:line for code/secret
+# findings — i.e. exactly what should be fixed.
 #
-# To make any single scan blocking again, remove its `continue-on-error: true`.
+# SARIF-capable scanners also upload to Security > Code scanning (requires code
+# scanning enabled: free for public repos, GitHub Advanced Security for private).
 
 on:
   push:
@@ -36,88 +37,90 @@ jobs:
     permissions:
       contents: read
       security-events: write
-    outputs:
-      status: ${{ steps.report.outputs.status }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Trivy scan → SARIF
+      - name: Trivy scan → JSON (findings feed)
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scanners: vuln,secret,misconfig
+          format: json
+          output: trivy.json
+          severity: CRITICAL,HIGH,MEDIUM,LOW
+
+      - name: Trivy scan → SARIF (code scanning)
+        continue-on-error: true
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: fs
           scanners: vuln,secret,misconfig
           format: sarif
-          output: trivy-fs.sarif
+          output: trivy.sarif
           severity: CRITICAL,HIGH,MEDIUM,LOW
 
       - name: Upload SARIF to code scanning
-        continue-on-error: true # tolerate repos without code scanning enabled
+        continue-on-error: true
         uses: github/codeql-action/upload-sarif@v3
         with:
-          sarif_file: trivy-fs.sarif
+          sarif_file: trivy.sarif
           category: trivy-fs
 
-      - name: Trivy check (fixable HIGH/CRITICAL)
-        id: scan
-        continue-on-error: true
-        uses: aquasecurity/trivy-action@v0.36.0
+      - uses: actions/upload-artifact@v4
         with:
-          scan-type: fs
-          scanners: vuln,secret,misconfig
-          severity: CRITICAL,HIGH
-          ignore-unfixed: true
-          exit-code: '1'
-
-      - id: report
-        run: echo "status=${{ steps.scan.outcome }}" >> "$GITHUB_OUTPUT"
+          name: sec-report-trivy
+          path: trivy.json
+          if-no-files-found: ignore
 
   # ---------------------------------------------------------------------------
-  # Hadolint: lint all three Dockerfiles (one job, non-blocking).
+  # Hadolint: lint all three Dockerfiles → JSON.
   # ---------------------------------------------------------------------------
   hadolint:
     name: Hadolint (Dockerfiles)
     runs-on: ubuntu-latest
-    outputs:
-      status: ${{ steps.report.outputs.status }}
     steps:
       - uses: actions/checkout@v4
-      - name: Lint Dockerfiles
-        id: scan
+      - name: Lint Dockerfiles → JSON
         continue-on-error: true
         run: |
-          rc=0
+          : > hadolint.parts
           for f in services/goapi/Dockerfile services/rscounter/Dockerfile js/Dockerfile; do
-            echo "::group::hadolint $f"
-            docker run --rm -i hadolint/hadolint hadolint --failure-threshold warning - < "$f" || rc=1
-            echo "::endgroup::"
+            docker run --rm -i hadolint/hadolint hadolint --no-fail --format json - < "$f" \
+              | jq --arg f "$f" 'map(.file = $f)' >> hadolint.parts
           done
-          exit $rc
-      - id: report
-        run: echo "status=${{ steps.scan.outcome }}" >> "$GITHUB_OUTPUT"
+          jq -s 'add // []' hadolint.parts > hadolint.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sec-report-hadolint
+          path: hadolint.json
+          if-no-files-found: ignore
 
   # ---------------------------------------------------------------------------
-  # Gitleaks: scan the git history for committed secrets.
+  # Gitleaks: scan the git history for committed secrets → JSON.
   # ---------------------------------------------------------------------------
   gitleaks:
     name: Gitleaks (secrets)
     runs-on: ubuntu-latest
-    outputs:
-      status: ${{ steps.report.outputs.status }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Run gitleaks
-        id: scan
+      - name: Run gitleaks → JSON
         continue-on-error: true
-        uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - id: report
-        run: echo "status=${{ steps.scan.outcome }}" >> "$GITHUB_OUTPUT"
+        run: |
+          docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:latest \
+            detect --source=/repo --report-format json --report-path /repo/gitleaks.json \
+            --redact --exit-code 0 --no-banner
+          [ -f gitleaks.json ] || echo '[]' > gitleaks.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sec-report-gitleaks
+          path: gitleaks.json
+          if-no-files-found: ignore
 
   # ---------------------------------------------------------------------------
-  # Semgrep: multi-language SAST using the public rule registry.
+  # Semgrep: multi-language SAST using the public rule registry → SARIF.
   # ---------------------------------------------------------------------------
   semgrep:
     name: Semgrep (SAST)
@@ -125,33 +128,31 @@ jobs:
     permissions:
       contents: read
       security-events: write
-    outputs:
-      status: ${{ steps.report.outputs.status }}
     steps:
       - uses: actions/checkout@v4
       - name: Install Semgrep
         run: pipx install semgrep
       - name: Semgrep scan → SARIF
-        id: scan
         continue-on-error: true
-        run: semgrep scan --config auto --sarif --output semgrep.sarif --error
+        run: semgrep scan --config auto --sarif --output semgrep.sarif
       - name: Upload SARIF to code scanning
         continue-on-error: true
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: semgrep.sarif
           category: semgrep
-      - id: report
-        run: echo "status=${{ steps.scan.outcome }}" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sec-report-semgrep
+          path: semgrep.sarif
+          if-no-files-found: ignore
 
   # ---------------------------------------------------------------------------
-  # Go: govulncheck against the Go vulnerability database.
+  # Go: govulncheck against the Go vulnerability database → JSON.
   # ---------------------------------------------------------------------------
   govulncheck:
     name: govulncheck (Go)
     runs-on: ubuntu-latest
-    outputs:
-      status: ${{ steps.report.outputs.status }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -160,70 +161,66 @@ jobs:
           cache: false
       - name: Install govulncheck
         run: go install golang.org/x/vuln/cmd/govulncheck@latest
-      - name: Run govulncheck
-        id: scan
+      - name: Run govulncheck → JSON
         continue-on-error: true
         working-directory: services/goapi
-        run: govulncheck ./...
-      - id: report
-        run: echo "status=${{ steps.scan.outcome }}" >> "$GITHUB_OUTPUT"
+        run: govulncheck -json ./... > "$GITHUB_WORKSPACE/govulncheck.json" || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sec-report-govulncheck
+          path: govulncheck.json
+          if-no-files-found: ignore
 
   # ---------------------------------------------------------------------------
-  # Rust: cargo-audit (advisories) and cargo-deny (advisories + licenses).
+  # Rust: cargo-audit (advisories) → JSON.
   # ---------------------------------------------------------------------------
   cargo-audit:
     name: cargo-audit (Rust)
     runs-on: ubuntu-latest
-    outputs:
-      status: ${{ steps.report.outputs.status }}
-    defaults:
-      run:
-        working-directory: services/rscounter
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-audit
-      - name: Run cargo audit
-        id: scan
+      - name: Run cargo audit → JSON
         continue-on-error: true
-        run: cargo audit
-      - id: report
-        run: echo "status=${{ steps.scan.outcome }}" >> "$GITHUB_OUTPUT"
+        working-directory: services/rscounter
+        run: cargo audit --json > "$GITHUB_WORKSPACE/cargo-audit.json" || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sec-report-cargo-audit
+          path: cargo-audit.json
+          if-no-files-found: ignore
 
+  # ---------------------------------------------------------------------------
+  # Rust: cargo-deny (advisories + licenses + sources) → JSON lines.
+  # ---------------------------------------------------------------------------
   cargo-deny:
     name: cargo-deny (Rust)
     runs-on: ubuntu-latest
-    outputs:
-      status: ${{ steps.report.outputs.status }}
-    defaults:
-      run:
-        working-directory: services/rscounter
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny
-      - name: Run cargo deny
-        id: scan
+      - name: Run cargo deny → JSON lines
         continue-on-error: true
-        run: cargo deny check advisories bans licenses sources
-      - id: report
-        run: echo "status=${{ steps.scan.outcome }}" >> "$GITHUB_OUTPUT"
+        working-directory: services/rscounter
+        run: cargo deny --format json check advisories bans licenses sources 2> "$GITHUB_WORKSPACE/cargo-deny.jsonl" || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sec-report-cargo-deny
+          path: cargo-deny.jsonl
+          if-no-files-found: ignore
 
   # ---------------------------------------------------------------------------
-  # JS: pnpm audit against the npm advisory database.
+  # JS: pnpm audit against the npm advisory database → JSON.
   # ---------------------------------------------------------------------------
   pnpm-audit:
     name: pnpm audit (JS)
     runs-on: ubuntu-latest
-    outputs:
-      status: ${{ steps.report.outputs.status }}
-    defaults:
-      run:
-        working-directory: js
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -234,37 +231,33 @@ jobs:
           node-version: 26
           cache: pnpm
           cache-dependency-path: js/pnpm-lock.yaml
-      - name: Run pnpm audit
-        id: scan
+      - name: Run pnpm audit → JSON
         continue-on-error: true
-        run: pnpm audit --audit-level high
-      - id: report
-        run: echo "status=${{ steps.scan.outcome }}" >> "$GITHUB_OUTPUT"
+        working-directory: js
+        run: pnpm audit --json > "$GITHUB_WORKSPACE/pnpm-audit.json" || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sec-report-pnpm-audit
+          path: pnpm-audit.json
+          if-no-files-found: ignore
 
   # ---------------------------------------------------------------------------
-  # Dependency review: flag risky dependency changes (PRs only).
+  # Dependency review: risky dependency changes (PRs only) → SARIF-ish table.
+  # (Its own PR annotations are the primary output; included here for parity.)
   # ---------------------------------------------------------------------------
   dependency-review:
     name: Dependency review
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    outputs:
-      status: ${{ steps.report.outputs.status }}
     steps:
       - uses: actions/checkout@v4
-      - name: Dependency review
-        id: scan
+      - uses: actions/dependency-review-action@v4
         continue-on-error: true
-        uses: actions/dependency-review-action@v4
         with:
           fail-on-severity: high
-      - id: report
-        run: echo "status=${{ steps.scan.outcome }}" >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------
-  # Global report: one table summarizing every scan on the run's summary page.
-  # Always runs; never fails — it only reports. Change the final line to fail
-  # the workflow when something is bad if you want it to block.
+  # Global report: parse every scanner's output into one actionable table.
   # ---------------------------------------------------------------------------
   security-summary:
     name: Security summary
@@ -278,71 +271,191 @@ jobs:
       - cargo-audit
       - cargo-deny
       - pnpm-audit
-      - dependency-review
     runs-on: ubuntu-latest
     steps:
-      - name: Compose report
-        env:
-          TRIVY_R: ${{ needs.trivy-fs.result }}
-          TRIVY_S: ${{ needs.trivy-fs.outputs.status }}
-          HADOLINT_R: ${{ needs.hadolint.result }}
-          HADOLINT_S: ${{ needs.hadolint.outputs.status }}
-          GITLEAKS_R: ${{ needs.gitleaks.result }}
-          GITLEAKS_S: ${{ needs.gitleaks.outputs.status }}
-          SEMGREP_R: ${{ needs.semgrep.result }}
-          SEMGREP_S: ${{ needs.semgrep.outputs.status }}
-          GOVULN_R: ${{ needs.govulncheck.result }}
-          GOVULN_S: ${{ needs.govulncheck.outputs.status }}
-          AUDIT_R: ${{ needs.cargo-audit.result }}
-          AUDIT_S: ${{ needs.cargo-audit.outputs.status }}
-          DENY_R: ${{ needs.cargo-deny.result }}
-          DENY_S: ${{ needs.cargo-deny.outputs.status }}
-          PNPM_R: ${{ needs.pnpm-audit.result }}
-          PNPM_S: ${{ needs.pnpm-audit.outputs.status }}
-          DEPREV_R: ${{ needs.dependency-review.result }}
-          DEPREV_S: ${{ needs.dependency-review.outputs.status }}
-        run: |
-          # cell <job-result> <scan-status> -> a human-readable table cell.
-          cell() {
-            local result="$1" status="$2"
-            if [ "$result" = "skipped" ]; then echo "⏭️ Skipped (not applicable)"; return; fi
-            case "$status" in
-              success) echo "✅ Passed" ;;
-              failure) echo "❌ Findings — see job log" ;;
-              *)       echo "⚠️ Errored — see job log" ;;  # infra/setup failure
-            esac
-          }
+      - name: Download all reports
+        uses: actions/download-artifact@v4
+        with:
+          path: reports
+          pattern: sec-report-*
+          merge-multiple: true
 
-          findings=0
-          note() { case "$1" in failure) findings=$((findings+1));; esac; }
-          note "$TRIVY_S"; note "$HADOLINT_S"; note "$GITLEAKS_S"; note "$SEMGREP_S"
-          note "$GOVULN_S"; note "$AUDIT_S"; note "$DENY_S"; note "$PNPM_S"; note "$DEPREV_S"
+      - name: Build actionable summary
+        run: |
+          set -euo pipefail
+          cd reports 2>/dev/null || { echo "No reports produced." >> "$GITHUB_STEP_SUMMARY"; exit 0; }
+
+          : > findings.jsonl
+
+          # Normalize a severity string to CRITICAL/HIGH/MEDIUM/LOW/INFO.
+          # Each tool's jq below emits already-normalized severities.
+
+          # --- Trivy: dependency vulns, secrets, and Dockerfile/IaC misconfig ---
+          if [ -f trivy.json ]; then
+            jq -c '
+              .Results[]? as $r | $r.Target as $t
+              | ( ($r.Vulnerabilities[]? | {severity:.Severity, tool:"trivy", category:"dependency",
+                    id:.VulnerabilityID, package:(.PkgName + "@" + (.InstalledVersion//"?")),
+                    installed:(.InstalledVersion//""), fixed:(.FixedVersion//""),
+                    title:(.Title // .Description // ""), url:(.PrimaryURL//"")}),
+                  ($r.Misconfigurations[]? | {severity:.Severity, tool:"trivy", category:"dockerfile",
+                    id:.ID, package:$t, installed:"", fixed:(.Resolution//""),
+                    title:.Title, url:(.PrimaryURL//"")}),
+                  ($r.Secrets[]? | {severity:(.Severity//"CRITICAL"), tool:"trivy", category:"secret",
+                    id:.RuleID, package:($t + ":" + (.StartLine|tostring)), installed:"", fixed:"",
+                    title:.Title, url:""}) )
+            ' trivy.json >> findings.jsonl 2>/dev/null || true
+          fi
+
+          # --- govulncheck: Go stdlib / module vulns actually reachable ---
+          if [ -f govulncheck.json ] && [ -s govulncheck.json ]; then
+            jq -s -c '
+              (map(select(.osv) | {(.osv.id): .osv.summary}) | add // {}) as $sum
+              | map(select(.finding) | .finding)
+              | map(select((.trace[0].module // "") != ""))
+              | map({osv:.osv, module:.trace[0].module, ver:(.trace[0].version//""), fixed:(.fixed_version//"")})
+              | unique_by(.osv)
+              | .[] | {severity:"HIGH", tool:"govulncheck", category:"dependency",
+                       id:.osv, package:(.module + "@" + .ver), installed:.ver, fixed:.fixed,
+                       title:($sum[.osv] // ""), url:("https://pkg.go.dev/vuln/" + .osv)}
+            ' govulncheck.json >> findings.jsonl 2>/dev/null || true
+          fi
+
+          # --- cargo-audit: RustSec advisories ---
+          if [ -f cargo-audit.json ] && [ -s cargo-audit.json ]; then
+            jq -c '
+              .vulnerabilities.list[]? |
+              {severity:"HIGH", tool:"cargo-audit", category:"dependency",
+               id:.advisory.id, package:(.package.name + "@" + .package.version),
+               installed:.package.version, fixed:((.versions.patched // []) | join(", ")),
+               title:.advisory.title, url:(.advisory.url // ("https://rustsec.org/advisories/" + .advisory.id))}
+            ' cargo-audit.json >> findings.jsonl 2>/dev/null || true
+          fi
+
+          # --- cargo-deny: license/advisory/source policy diagnostics ---
+          if [ -f cargo-deny.jsonl ] && [ -s cargo-deny.jsonl ]; then
+            jq -c 'select(.type=="diagnostic") | .fields |
+              {severity:((.severity // "warning") | ascii_upcase | if .=="ERROR" then "HIGH" elif .=="WARNING" then "MEDIUM" else "LOW" end),
+               tool:"cargo-deny", category:"license", id:(.code.code // .code // "policy"),
+               package:"", installed:"", fixed:"", title:(.message // ""), url:""}
+            ' cargo-deny.jsonl >> findings.jsonl 2>/dev/null || true
+          fi
+
+          # --- pnpm audit: npm advisories ---
+          if [ -f pnpm-audit.json ] && [ -s pnpm-audit.json ]; then
+            jq -c '
+              (.advisories // {}) | to_entries[] | .value |
+              {severity:((.severity // "moderate") | ascii_upcase | if .=="MODERATE" then "MEDIUM" else . end),
+               tool:"pnpm-audit", category:"dependency", id:(.github_advisory_id // (.cves[0]?) // (.id|tostring)),
+               package:.module_name, installed:"", fixed:(.patched_versions // ""),
+               title:.title, url:(.url // "")}
+            ' pnpm-audit.json >> findings.jsonl 2>/dev/null || true
+          fi
+
+          # --- Semgrep: SAST findings ---
+          if [ -f semgrep.sarif ] && [ -s semgrep.sarif ]; then
+            jq -c '
+              .runs[]?.results[]? |
+              {severity:(((.properties.severity // .level) // "warning") | ascii_upcase
+                         | if .=="ERROR" then "HIGH" elif .=="WARNING" then "MEDIUM" elif .=="INFO" or .=="NOTE" then "LOW" else . end),
+               tool:"semgrep", category:"code", id:.ruleId,
+               package:((.locations[0].physicalLocation.artifactLocation.uri // "?") + ":" +
+                        ((.locations[0].physicalLocation.region.startLine // 0)|tostring)),
+               installed:"", fixed:"", title:(.message.text // ""), url:""}
+            ' semgrep.sarif >> findings.jsonl 2>/dev/null || true
+          fi
+
+          # --- Hadolint: Dockerfile findings ---
+          if [ -f hadolint.json ] && [ -s hadolint.json ]; then
+            jq -c '
+              .[]? |
+              {severity:((.level // "warning") | ascii_upcase
+                         | if .=="ERROR" then "HIGH" elif .=="WARNING" then "MEDIUM" else "LOW" end),
+               tool:"hadolint", category:"dockerfile", id:.code,
+               package:(.file + ":" + (.line|tostring)), installed:"", fixed:"",
+               title:.message, url:("https://github.com/hadolint/hadolint/wiki/" + .code)}
+            ' hadolint.json >> findings.jsonl 2>/dev/null || true
+          fi
+
+          # --- Gitleaks: leaked secrets ---
+          if [ -f gitleaks.json ] && [ -s gitleaks.json ]; then
+            jq -c '
+              .[]? |
+              {severity:"CRITICAL", tool:"gitleaks", category:"secret", id:.RuleID,
+               package:(.File + ":" + ((.StartLine // 0)|tostring)), installed:"", fixed:"",
+               title:(.Description // "secret detected"), url:""}
+            ' gitleaks.json >> findings.jsonl 2>/dev/null || true
+          fi
+
+          # ---------------------------------------------------------------------
+          # Render the Job Summary.
+          # ---------------------------------------------------------------------
+          total=$(wc -l < findings.jsonl | tr -d ' ')
+
+          sev_count() { jq -r --arg s "$1" '[select(.severity==$s)]|length' findings.jsonl 2>/dev/null | awk '{n+=$1} END{print n+0}'; }
+          C=$(jq -rs '[.[]|select(.severity=="CRITICAL")]|length' findings.jsonl 2>/dev/null || echo 0)
+          H=$(jq -rs '[.[]|select(.severity=="HIGH")]|length' findings.jsonl 2>/dev/null || echo 0)
+          M=$(jq -rs '[.[]|select(.severity=="MEDIUM")]|length' findings.jsonl 2>/dev/null || echo 0)
+          L=$(jq -rs '[.[]|select(.severity=="LOW")]|length' findings.jsonl 2>/dev/null || echo 0)
 
           {
-            echo "## 🔒 Security scan summary"
+            echo "## 🔒 Security findings"
             echo ""
-            echo "| Tool | Scope | Result |"
-            echo "| --- | --- | --- |"
-            echo "| Trivy | repo: deps, secrets, misconfig | $(cell "$TRIVY_R" "$TRIVY_S") |"
-            echo "| Hadolint | Dockerfiles | $(cell "$HADOLINT_R" "$HADOLINT_S") |"
-            echo "| Gitleaks | git history secrets | $(cell "$GITLEAKS_R" "$GITLEAKS_S") |"
-            echo "| Semgrep | multi-language SAST | $(cell "$SEMGREP_R" "$SEMGREP_S") |"
-            echo "| govulncheck | Go stdlib + deps | $(cell "$GOVULN_R" "$GOVULN_S") |"
-            echo "| cargo-audit | Rust advisories | $(cell "$AUDIT_R" "$AUDIT_S") |"
-            echo "| cargo-deny | Rust advisories/licenses | $(cell "$DENY_R" "$DENY_S") |"
-            echo "| pnpm audit | JS dependencies | $(cell "$PNPM_R" "$PNPM_S") |"
-            echo "| dependency-review | PR dependency diff | $(cell "$DEPREV_R" "$DEPREV_S") |"
+            echo "**Total:** ${total:-0} &nbsp;·&nbsp; 🔴 Critical: ${C:-0} &nbsp; 🟠 High: ${H:-0} &nbsp; 🟡 Medium: ${M:-0} &nbsp; ⚪ Low: ${L:-0}"
             echo ""
-            if [ "$findings" -eq 0 ]; then
-              echo "✅ **No findings reported.**"
-            else
-              echo "❌ **$findings scanner(s) reported findings.** Open the matching job above for details."
-            fi
-            echo ""
-            echo "> Scans are **reported, not blocking**. To make one block the pipeline,"
-            echo "> remove \`continue-on-error: true\` from its job in \`.github/workflows/security.yml\`."
           } >> "$GITHUB_STEP_SUMMARY"
 
-          # Reported-only by design: keep the workflow green. To make findings
-          # fail the run instead, replace the next line with: exit "$findings"
-          exit 0
+          # Table 1 — dependencies to upgrade (the most directly fixable).
+          jq -rs '
+            def rank: {"CRITICAL":0,"HIGH":1,"MEDIUM":2,"LOW":3,"INFO":4}[.]//5;
+            def esc: (.//"")|tostring|gsub("[|]";"\\|")|gsub("\n";" ")|.[0:90];
+            map(select(.category=="dependency")) | sort_by(.severity|rank) | .[]
+            | "| \(.severity) | \(.package|esc) | \(if (.fixed|tostring)=="" then "⚠️ no fix yet" else (.fixed|esc) end) | [\(.id|esc)](\(.url)) | \(.tool) |"
+          ' findings.jsonl > deps.md 2>/dev/null || true
+
+          {
+            echo "### 📦 Dependencies to upgrade"
+            echo ""
+            if [ -s deps.md ]; then
+              echo "| Severity | Package (installed) | Fix → version | Advisory | Scanner |"
+              echo "| --- | --- | --- | --- | --- |"
+              cat deps.md
+            else
+              echo "_No vulnerable dependencies reported._"
+            fi
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Table 2 — code / secret / Dockerfile / license findings.
+          jq -rs '
+            def rank: {"CRITICAL":0,"HIGH":1,"MEDIUM":2,"LOW":3,"INFO":4}[.]//5;
+            def esc: (.//"")|tostring|gsub("[|]";"\\|")|gsub("\n";" ")|.[0:90];
+            map(select(.category!="dependency")) | sort_by(.severity|rank) | .[]
+            | "| \(.severity) | \(.category) | \(.tool) | \(.id|esc) | \(.package|esc) | \(.title|esc) |"
+          ' findings.jsonl > code.md 2>/dev/null || true
+
+          {
+            echo "### 🔎 Code, secrets & Dockerfile findings"
+            echo ""
+            if [ -s code.md ]; then
+              echo "| Severity | Type | Scanner | Rule/ID | Location | Detail |"
+              echo "| --- | --- | --- | --- | --- | --- |"
+              cat code.md
+            else
+              echo "_No code, secret, or Dockerfile findings reported._"
+            fi
+            echo ""
+            echo "> Scans are **reported, not blocking**. Fix items top-down (Critical → Low)."
+            echo "> To fail the run on findings, change the summary's \`exit 0\` to \`exit 1\` when \`total\` > 0."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Also drop the raw normalized findings as an artifact-friendly file.
+          cp findings.jsonl "$GITHUB_WORKSPACE/findings.jsonl" 2>/dev/null || true
+
+      - name: Upload normalized findings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-findings
+          path: findings.jsonl
+          if-no-files-found: ignore
